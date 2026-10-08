@@ -175,6 +175,7 @@ local Themes = {
 
 local currentTheme = Themes[ConfigData.SelectedTheme] or Themes["Default"]
 local c_bg, c_sidebar, c_content, c_accent, c_text, c_subtext = currentTheme.bg, currentTheme.sidebar, currentTheme.content, currentTheme.accent, currentTheme.text, currentTheme.subtext
+local RefreshAllToastThemes
 
 local function ApplyTheme()
     local t = Themes[ConfigData.SelectedTheme] or Themes["Default"]
@@ -224,6 +225,11 @@ local isWeatherTPBusy = false
 local isArcadiaTPBusy = false
 local isPelletExecuting = false
 local isLifeMachineExecuting = false
+-- Teleport priority lock: Pellet owns teleport control during its 4-cycle batch.
+local teleportLockOwner = nil
+local ExecutePelletCycle -- forward declaration for the manual trigger
+local pelletAutoInsideInvader = false
+local pelletAutoStartAt = 0
 -- Shared priority flag: dideklarasikan sebelum semua thread agar weather/farm/machine
 -- dapat menghormati event Kraken sebagai prioritas tertinggi.
 local arcadiaEventActive = false
@@ -483,8 +489,13 @@ local function GetMachineTimerText()
     return "READY", 0
 end
 
+local NotifyToast
+
 local function ExecuteLifeMachine(UIStatus_LifeMachine, isManual)
     if isLifeMachineExecuting then return false end
+    -- Pellet has priority while a cycle/batch is actively controlling teleport.
+    if teleportLockOwner == "PELLET" then return false end
+    local acquiredLifeTeleportLock = false
 
     local character = player.Character
     local hrp = character and character:FindFirstChild("HumanoidRootPart")
@@ -499,6 +510,10 @@ local function ExecuteLifeMachine(UIStatus_LifeMachine, isManual)
         end
     end
 
+    if not teleportLockOwner then
+        teleportLockOwner = "LIFE"
+        acquiredLifeTeleportLock = true
+    end
     isLifeMachineExecuting = true
 
     if UIStatus_LifeMachine then
@@ -517,6 +532,7 @@ local function ExecuteLifeMachine(UIStatus_LifeMachine, isManual)
     -- ====================================================
     hrp.CFrame = lifeMachineCFrame
     hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    NotifyToast("Life Machine", "berhasil TP ke Life Machine", "success")
 
     -- Pendek saja: beri client/game waktu memperbarui posisi setelah TP.
     task.wait(0.25)
@@ -600,6 +616,7 @@ local function ExecuteLifeMachine(UIStatus_LifeMachine, isManual)
     end
 
     if machinePrompt then
+        NotifyToast("Life Machine", "Prompt berhasil ditemukan", "success")
         -- Hilangkan ketergantungan terhadap arah kamera/line-of-sight
         -- bila property ini tersedia di client.
         local oldLOS = machinePrompt.RequiresLineOfSight
@@ -647,13 +664,16 @@ local function ExecuteLifeMachine(UIStatus_LifeMachine, isManual)
     if returnRoot then
         returnRoot.CFrame = originalCFrame
         returnRoot.AssemblyLinearVelocity = originalVelocity
+        NotifyToast("Life Machine", "berhasil kembali ke posisi awal", "success")
     end
 
     if UIStatus_LifeMachine then
         if firedMachine then
+            NotifyToast("Life Machine", "sukses • mesin berhasil dipicu", "success")
             UIStatus_LifeMachine.Text = "✅ SUCCESS! SIKLUS SELESAI"
             UIStatus_LifeMachine.TextColor3 = Color3.fromRGB(50, 255, 100)
         else
+            NotifyToast("Life Machine", "gagal • prompt mesin tidak terpicu", "error")
             UIStatus_LifeMachine.Text = "⚠️ PROMPT MESIN TIDAK TERPICU"
             UIStatus_LifeMachine.TextColor3 = Color3.fromRGB(255, 180, 50)
         end
@@ -661,6 +681,9 @@ local function ExecuteLifeMachine(UIStatus_LifeMachine, isManual)
 
     task.wait(1.0)
     isLifeMachineExecuting = false
+    if acquiredLifeTeleportLock and teleportLockOwner == "LIFE" then
+        teleportLockOwner = nil
+    end
 
     return firedMachine
 end
@@ -1110,6 +1133,180 @@ local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "Shadow_Panel_V8"
 ScreenGui.Parent = CoreGui:FindFirstChild("RobloxGui") or CoreGui
 
+-- ========================================================
+-- COMPACT TOAST NOTIFICATION SYSTEM
+-- Safe/global notification layer: max 4 visible, FIFO queue, never drops.
+-- ========================================================
+local ToastHolder = Instance.new("Frame")
+ToastHolder.Name = "ToastHolder"
+ToastHolder.Size = UDim2.new(0, 250, 0, 185)
+ToastHolder.Position = UDim2.new(1, -10, 1, -10)
+ToastHolder.AnchorPoint = Vector2.new(1, 1)
+ToastHolder.BackgroundTransparency = 1
+ToastHolder.BorderSizePixel = 0
+ToastHolder.ZIndex = 1000
+ToastHolder.Parent = ScreenGui
+
+local ToastLayout = Instance.new("UIListLayout")
+ToastLayout.FillDirection = Enum.FillDirection.Vertical
+ToastLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+ToastLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+ToastLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ToastLayout.Padding = UDim.new(0, 5)
+ToastLayout.Parent = ToastHolder
+
+local toastSerial = 0
+local activeToasts = {}
+local queuedToasts = {}
+local toastBurstUntil = 0
+
+local function SafeToastTween(instance, info, props)
+    pcall(function()
+        TweenService:Create(instance, info, props):Play()
+    end)
+end
+
+local function BuildToast(title, message, kind)
+    toastSerial = toastSerial + 1
+
+    local toast = Instance.new("Frame")
+    toast.Name = "Toast_" .. tostring(toastSerial)
+    toast.Size = UDim2.new(0, 250, 0, 40)
+    toast.BackgroundTransparency = 1
+    toast.BorderSizePixel = 0
+    toast.LayoutOrder = toastSerial
+    toast.ZIndex = 1000
+    toast.Parent = ToastHolder
+
+    local card = Instance.new("Frame")
+    card.Name = "Card"
+    card.Size = UDim2.new(1, 0, 1, 0)
+    card.Position = UDim2.new(0, 22, 0, 0)
+    card.BackgroundColor3 = c_content
+    card.BackgroundTransparency = 0.12
+    card.BorderSizePixel = 0
+    card.ZIndex = 1001
+    card.Parent = toast
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 7)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = c_accent
+    stroke.Transparency = 0.35
+    stroke.Thickness = 1
+    stroke.Parent = card
+
+    local accent = Instance.new("Frame")
+    accent.Size = UDim2.new(0, 3, 1, -12)
+    accent.Position = UDim2.new(0, 5, 0, 6)
+    accent.BackgroundColor3 = c_accent
+    accent.BorderSizePixel = 0
+    accent.ZIndex = 1002
+    accent.Parent = card
+    Instance.new("UICorner", accent).CornerRadius = UDim.new(1, 0)
+
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(0, 22, 1, 0)
+    icon.Position = UDim2.new(0, 13, 0, 0)
+    icon.BackgroundTransparency = 1
+    icon.Text = (kind == "error" and "!") or (kind == "info" and "i") or "✓"
+    icon.TextColor3 = c_accent
+    icon.Font = Enum.Font.GothamBold
+    icon.TextSize = 14
+    icon.ZIndex = 1002
+    icon.Parent = card
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Label"
+    label.Size = UDim2.new(1, -48, 1, -6)
+    label.Position = UDim2.new(0, 38, 0, 3)
+    label.BackgroundTransparency = 1
+    label.Text = tostring(title) .. "  •  " .. tostring(message)
+    label.TextColor3 = c_text
+    label.Font = Enum.Font.GothamSemibold
+    label.TextSize = 10
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.TextWrapped = true
+    label.ZIndex = 1002
+    label.Parent = card
+
+    return toast
+end
+
+local function RemoveToast(toast)
+    for i = #activeToasts, 1, -1 do
+        if activeToasts[i] == toast then
+            table.remove(activeToasts, i)
+            break
+        end
+    end
+
+    if toast and toast.Parent then
+        local card = toast:FindFirstChild("Card")
+        if card then
+            SafeToastTween(card, TweenInfo.new(0.12), {
+                Position = UDim2.new(0, 24, 0, 0),
+                BackgroundTransparency = 1
+            })
+        end
+        task.delay(0.14, function()
+            pcall(function()
+                if toast and toast.Parent then toast:Destroy() end
+            end)
+        end)
+    end
+end
+
+local function ShowToast(data)
+    if #activeToasts >= 4 then return false end
+
+    local toast = BuildToast(data.title, data.message, data.kind)
+    table.insert(activeToasts, toast)
+
+    local card = toast:FindFirstChild("Card")
+    if card then
+        SafeToastTween(card, TweenInfo.new(0.12), {
+            Position = UDim2.new(0, 0, 0, 0)
+        })
+    end
+
+    -- Normal = 2s. During a burst/queue = 1.15s, while queued items remain.
+    local fast = (#activeToasts >= 4) or (#queuedToasts > 0) or (os.clock() < toastBurstUntil)
+    local lifetime = fast and 1.15 or 2.0
+
+    task.delay(lifetime, function()
+        RemoveToast(toast)
+        if #queuedToasts > 0 then
+            local nextData = table.remove(queuedToasts, 1)
+            task.defer(function()
+                ShowToast(nextData)
+            end)
+        end
+    end)
+
+    return true
+end
+
+NotifyToast = function(title, message, kind)
+    -- Notifications must never be able to break the main script.
+    pcall(function()
+        title = tostring(title or "Shadow Hub")
+        message = tostring(message or "")
+        kind = kind or "success"
+
+        if #activeToasts >= 3 then
+            toastBurstUntil = os.clock() + 0.8
+        end
+
+        local data = {title = title, message = message, kind = kind}
+        if #activeToasts < 4 then
+            ShowToast(data)
+        else
+            table.insert(queuedToasts, data)
+        end
+    end)
+end
+
 local MainFrame = Instance.new("Frame", ScreenGui)
 MainFrame.Size = UDim2.new(0, ConfigData.UISizeX or 520, 0, ConfigData.UISizeY or 320)
 MainFrame.Position = UDim2.new(0.5, -(ConfigData.UISizeX or 520)/2, 0.5, -(ConfigData.UISizeY or 320)/2)
@@ -1241,8 +1438,13 @@ local function CreateDropdown(parent, titleText)
     ItemLayout.Padding = UDim.new(0, 6); ItemLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
     Instance.new("UIPadding", ItemsContainer).PaddingBottom = UDim.new(0, 8)
 
-    local isOpen = true
-    TopBtn.MouseButton1Click:Connect(function() isOpen = not isOpen; ItemsContainer.Visible = isOpen end)
+    -- Default dropdown state: CLOSED
+    local isOpen = false
+    ItemsContainer.Visible = false
+    TopBtn.MouseButton1Click:Connect(function()
+        isOpen = not isOpen
+        ItemsContainer.Visible = isOpen
+    end)
     return ItemsContainer
 end
 
@@ -1280,7 +1482,17 @@ local function CreateToggle(parent, text, configKey, callback)
     end
 
     ToggleBtn.MouseButton1Click:Connect(function()
-        state = not state; ConfigData[configKey] = state; SaveConfig(); UI_Updaters[configKey](state)
+        state = not state
+        ConfigData[configKey] = state
+        SaveConfig()
+        UI_Updaters[configKey](state)
+        local toastTitle = (configKey == "AutoPellet" and "Pellet Machine")
+            or (configKey == "AutoFishingToggle" and "Auto Fishing")
+            or (configKey == "AutoTP" and "Auto TP Cuaca")
+            or (configKey == "AutoArcadia" and "Auto TP Kraken")
+            or (configKey == "AutoLifeMachine" and "Life Machine")
+            or text
+        NotifyToast(toastTitle, state and "berhasil ON" or "berhasil OFF", state and "success" or "info")
     end)
     if state and callback then callback(state) end
 end
@@ -1291,7 +1503,20 @@ local function CreateButton(parent, text, callback)
     Btn.Text = text; Btn.TextColor3 = c_text; Btn:SetAttribute("ThemeRole", "text"); Btn.Font = Enum.Font.GothamSemibold; Btn.TextSize = 10
     Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 6)
     local s = Instance.new("UIStroke", Btn); s.Color = Color3.fromRGB(50, 50, 60); s.Thickness = 1
-    Btn.MouseButton1Click:Connect(callback)
+    Btn.MouseButton1Click:Connect(function()
+        local result = callback and callback()
+        -- Every button action gets a toast. Callbacks may return a custom
+        -- message for a more precise notification (e.g. TP destination).
+        if result ~= false then
+            local msg = type(result) == "string" and result or "berhasil dijalankan"
+            local lowerText = string.lower(text)
+            -- Pellet has its own detailed cycle notifications; avoid a duplicate
+            -- generic toast for that button.
+            if not string.find(lowerText, "pellet machine", 1, true) then
+                NotifyToast(text, msg, "success")
+            end
+        end
+    end)
     return Btn
 end
 
@@ -1307,7 +1532,12 @@ local function CreateTextBox(parent, placeholder, configKey, callback)
     Box.PlaceholderColor3 = c_subtext; Box.Font = Enum.Font.GothamSemibold; Box.TextSize = 10; Box.TextXAlignment = Enum.TextXAlignment.Left; Box.ClearTextOnFocus = false
     
     UI_Updaters[configKey] = function(newState) Box.Text = tostring(newState) end
-    Box.FocusLost:Connect(function() ConfigData[configKey] = Box.Text; SaveConfig(); if callback then callback(Box.Text) end end)
+    Box.FocusLost:Connect(function()
+        ConfigData[configKey] = Box.Text
+        SaveConfig()
+        if callback then callback(Box.Text) end
+        NotifyToast(placeholder, "berhasil disimpan", "success")
+    end)
 end
 
 local function CreateStatusLabel(parent)
@@ -1364,6 +1594,7 @@ local function CreateSelector(parent, titleText, items, onSelect)
             btn.MouseButton1Click:Connect(function()
                 SelectBtn.Text = item; SelectBtn.TextColor3 = c_text; SelectBtn:SetAttribute("ThemeRole", "text"); ListContainer.Visible = false
                 if onSelect then onSelect(item) end
+                NotifyToast(titleText, "berhasil pilih: " .. tostring(item), "info")
             end)
             ySize = ySize + 26
         end
@@ -1403,7 +1634,9 @@ local BtnTPElementalManual = CreateButton(DropElemental, "Teleport Manual to Wea
     if hrp and spotKordinat[selectedElementalMapKey] then
         local targetCF = spotKordinat[selectedElementalMapKey]
         hrp.CFrame = CFrame.new(targetCF.Position + Vector3.new(0, 3, 0)) * targetCF.Rotation; hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        return "berhasil TP ke " .. tostring(selectedElementalMapKey)
     end
+    return false
 end)
 BtnTPElementalManual.BackgroundColor3 = c_sidebar; BtnTPElementalManual.TextColor3 = c_accent
 BtnTPElementalManual:SetAttribute("ThemeRole", "accent_text"); Instance.new("UIStroke", BtnTPElementalManual).Color = c_accent
@@ -1420,7 +1653,9 @@ local BtnTPArcadiaManual = CreateButton(DropArcadia, "Teleport Manual to Arcadia
     if hrp and spotKordinat.Arcadia then
         local targetCF = spotKordinat.Arcadia
         hrp.CFrame = CFrame.new(targetCF.Position + Vector3.new(0, 3, 0)) * targetCF.Rotation; hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        return "berhasil TP ke Arcadia"
     end
+    return false
 end)
 BtnTPArcadiaManual.BackgroundColor3 = c_sidebar; BtnTPArcadiaManual.TextColor3 = c_accent
 BtnTPArcadiaManual:SetAttribute("ThemeRole", "accent_text"); Instance.new("UIStroke", BtnTPArcadiaManual).Color = c_accent
@@ -1444,15 +1679,18 @@ if not ConfigData.AutoFishingToggle then UIStatus_Fishing.Text = "AUTO FISHING: 
 
 local BtnManualTPThrone = CreateButton(DropFishing, "📌 Manual TP ke Throne Room", function()
     local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-    if hrp then hrp.CFrame = CFrame.new(standPositionRot); hrp.AssemblyLinearVelocity = Vector3.new(0,0,0) end
+    if hrp then hrp.CFrame = CFrame.new(standPositionRot); hrp.AssemblyLinearVelocity = Vector3.new(0,0,0); return "berhasil TP ke Throne Room" end
+    return false
 end)
 local BtnManualTPCanyon = CreateButton(DropFishing, "📌 Manual TP ke Canyon", function()
     local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-    if hrp then hrp.CFrame = map2CFrame; hrp.AssemblyLinearVelocity = Vector3.new(0,0,0) end
+    if hrp then hrp.CFrame = map2CFrame; hrp.AssemblyLinearVelocity = Vector3.new(0,0,0); return "berhasil TP ke Canyon" end
+    return false
 end)
 local BtnManualTPInvader = CreateButton(DropFishing, "📌 Manual TP ke Invader's", function()
     local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-    if hrp then hrp.CFrame = invaderCFrame; hrp.AssemblyLinearVelocity = Vector3.new(0,0,0) end
+    if hrp then hrp.CFrame = invaderCFrame; hrp.AssemblyLinearVelocity = Vector3.new(0,0,0); return "berhasil TP ke Invader's" end
+    return false
 end)
 
 local BtnResetDualMap = CreateButton(DropFishing, "🔄 Reset Farm State", function()
@@ -1475,6 +1713,7 @@ end)
 -- ========================================================
 local DropPellet = CreateDropdown(TabArcadiaEvent, "🎰 Pellet Machine Automation")
 local UIStatus_Pellet = CreateStatusLabel(DropPellet)
+local pelletToggleReady = false
 
 if not ConfigData.AutoPellet then 
     UIStatus_Pellet.Text = "AUTO PELLET: OFF"
@@ -1483,13 +1722,34 @@ end
 
 CreateToggle(DropPellet, "Enable Auto Pellet Machine", "AutoPellet", function(state)
     if state then
-        UIStatus_Pellet.Text = "AUTO PELLET: ON (MENUNGGU SIKLUS)"
+        UIStatus_Pellet.Text = "AUTO PELLET: ON (MENUNGGU INVADER'S)"
         UIStatus_Pellet.TextColor3 = Color3.fromRGB(50, 255, 100)
+        pelletAutoInsideInvader = false
+        pelletAutoStartAt = 0
     else
         UIStatus_Pellet.Text = "AUTO PELLET: OFF"
         UIStatus_Pellet.TextColor3 = c_subtext
+        pelletAutoInsideInvader = false
+        pelletAutoStartAt = 0
     end
 end)
+pelletToggleReady = true
+
+local BtnManualPellet = CreateButton(DropPellet, "📌 Manual Pellet Machine (Force)", function()
+    if ExecutePelletCycle then
+        NotifyToast("Pellet Machine", "manual force dijalankan", "info")
+        task.spawn(function()
+            local ok = ExecutePelletCycle(true)
+            if not ok then
+                NotifyToast("Pellet Machine", "manual gagal / sedang dipakai sistem lain", "error")
+            end
+        end)
+    end
+end)
+BtnManualPellet.BackgroundColor3 = c_sidebar
+BtnManualPellet.TextColor3 = c_accent
+BtnManualPellet:SetAttribute("ThemeRole", "accent_text")
+Instance.new("UIStroke", BtnManualPellet).Color = c_accent
 
 local DropLifeMachine = CreateDropdown(TabArcadiaEvent, "⚙️ Life Machine Automation")
 local UIStatus_LifeMachine = CreateStatusLabel(DropLifeMachine)
@@ -1519,9 +1779,11 @@ CreateToggle(DropLifeMachine, "Enable Life Machine", "AutoLifeMachine", function
 end)
 
 local BtnManualLifeMachine = CreateButton(DropLifeMachine, "⚡ Manual Trigger Life Machine", function()
-    if not isLifeMachineExecuting and not isPelletExecuting and not arcadiaEventActive then
+    if not isLifeMachineExecuting and not isPelletExecuting and teleportLockOwner ~= "PELLET" and not arcadiaEventActive then
         task.spawn(function() ExecuteLifeMachine(UIStatus_LifeMachine, true) end)
+        return "manual trigger berhasil dimulai"
     end
+    return false
 end)
 BtnManualLifeMachine.BackgroundColor3 = c_sidebar
 BtnManualLifeMachine.TextColor3 = c_accent
@@ -1570,7 +1832,11 @@ local BtnTeleportMap = CreateButton(DropMapTP, "Teleport", function()
     for _, map in ipairs(MapLocations) do
         if map.Name == selectedMap then
             local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-            if hrp then hrp.CFrame = CFrame.new(map.Pos) * CFrame.Angles(0, math.rad(map.Rot), 0); hrp.AssemblyLinearVelocity = Vector3.new(0,0,0) end
+            if hrp then
+                hrp.CFrame = CFrame.new(map.Pos) * CFrame.Angles(0, math.rad(map.Rot), 0)
+                hrp.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                return "berhasil TP ke " .. tostring(map.Name)
+            end
             break
         end
     end
@@ -1585,7 +1851,12 @@ local BtnTeleportPlayer = CreateButton(DropPlayerTP, "Teleport to selected Playe
     if not selectedPlayerObj then return end
     local myHrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
     local targetHrp = selectedPlayerObj.Character and selectedPlayerObj.Character:FindFirstChild("HumanoidRootPart")
-    if myHrp and targetHrp then myHrp.CFrame = targetHrp.CFrame; myHrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end
+    if myHrp and targetHrp then
+        myHrp.CFrame = targetHrp.CFrame
+        myHrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        return "berhasil TP ke " .. tostring(selectedPlayerObj.DisplayName or selectedPlayerObj.Name)
+    end
+    return false
 end)
 BtnTeleportPlayer.BackgroundColor3 = c_sidebar; BtnTeleportPlayer.TextColor3 = c_accent
 BtnTeleportPlayer:SetAttribute("ThemeRole", "accent_text"); Instance.new("UIStroke", BtnTeleportPlayer).Color = c_accent
@@ -1610,6 +1881,7 @@ local BtnSaveLoc = CreateButton(DropSavedTP, "Save Current Location", function()
         SaveConfig()
         BtnSaveLoc.Text = "Location Saved Permanently!"
         BtnSaveLoc.TextColor3 = Color3.fromRGB(50, 255, 100)
+        return "lokasi berhasil disimpan"
     else
         BtnSaveLoc.Text = "Player Not Found!"
         BtnSaveLoc.TextColor3 = Color3.fromRGB(255, 100, 100)
@@ -1632,9 +1904,11 @@ local BtnTeleportLoc = CreateButton(DropSavedTP, "Teleport to Saved", function()
         hrp.AssemblyLinearVelocity = Vector3.new(0,0,0)
         BtnTeleportLoc.Text = "Teleported to Saved!"
         BtnTeleportLoc.TextColor3 = Color3.fromRGB(100, 200, 255)
+        return "berhasil TP ke Saved Location"
     else
         BtnTeleportLoc.Text = "No Save Found!"
         BtnTeleportLoc.TextColor3 = Color3.fromRGB(255, 100, 100)
+        return false
     end
     task.delay(2, function()
         BtnTeleportLoc.Text = "Teleport to Saved"
@@ -1659,7 +1933,12 @@ player.CharacterAdded:Connect(function(char)
     if ConfigData.AutoTeleportSpawn and savedCustomLocation then
         task.spawn(function()
             local hrp = char:WaitForChild("HumanoidRootPart", 5)
-            if hrp then task.wait(0.5); hrp.CFrame = savedCustomLocation; hrp.AssemblyLinearVelocity = Vector3.new(0,0,0) end
+            if hrp then
+                task.wait(0.5)
+                hrp.CFrame = savedCustomLocation
+                hrp.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                NotifyToast("Auto Teleport Spawn", "berhasil TP ke Saved Location", "success")
+            end
         end)
     end
 end)
@@ -1984,8 +2263,11 @@ task.spawn(function()
                 end
             elseif schedule.state == "ACTIVE" then
                 UIStatus_Elemental.Text = "MENUJU PAPAN..."; UIStatus_Elemental.TextColor3 = Color3.fromRGB(100, 200, 255)
-                if not isPelletExecuting and not isLifeMachineExecuting and not hasTeleportedToWeather then
-                    hrp.CFrame = spotKordinat.Board; hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0); task.wait(1.5)
+                if not isPelletExecuting and teleportLockOwner ~= "PELLET" and not isLifeMachineExecuting and not hasTeleportedToWeather then
+                    hrp.CFrame = spotKordinat.Board
+                    hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    NotifyToast("Auto TP Cuaca", "berhasil TP ke Board", "success")
+                    task.wait(1.5)
                 end
                 
                 local cuacaAktif = GetWeatherIconOnly()
@@ -1998,10 +2280,11 @@ task.spawn(function()
                         UIStatus_Elemental.TextColor3 = Color3.fromRGB(50, 255, 100)
                         
                         -- Execute teleport once safely (No Lock Loop)
-                        if hrp and targetCFrame and not hasTeleportedToWeather and not isPelletExecuting and not isLifeMachineExecuting and not arcadiaEventActive then
+                        if hrp and targetCFrame and not hasTeleportedToWeather and not isPelletExecuting and teleportLockOwner ~= "PELLET" and not isLifeMachineExecuting and not arcadiaEventActive then
                             hrp.CFrame = CFrame.new(targetCFrame.Position + Vector3.new(0, 3, 0)) * targetCFrame.Rotation
                             hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                             hasTeleportedToWeather = true
+                            NotifyToast("Auto TP Cuaca", "berhasil TP ke " .. tostring(cuacaAktif), "success")
                             if ConfigData.AutoFishingToggle then forceFarmTP = true end
                         end
                         task.wait(1)
@@ -2160,6 +2443,7 @@ local function StartArcadiaEvent(source)
         hrp.CFrame = CFrame.new(targetCFrame.Position + Vector3.new(0, 3, 0)) * targetCFrame.Rotation
         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        NotifyToast("Auto TP Kraken", "berhasil TP ke Arcadia", "success")
     end
 
     if UIStatus_Arcadia then
@@ -2199,6 +2483,7 @@ local function FinishArcadiaEvent(reason)
     arcadiaEventSource = "NONE"
     arcadiaBackupDeadline = nil
     arcadiaBattleUISeen = false
+    NotifyToast("Auto TP Kraken", "event selesai • berhasil kembali", "success")
 end
 
 task.spawn(function()
@@ -2308,7 +2593,7 @@ task.spawn(function()
                 end
             end
 
-            if not isLifeMachineExecuting and not isPelletExecuting then
+            if not isLifeMachineExecuting and not isPelletExecuting and teleportLockOwner ~= "PELLET" then
                 local character = player.Character
                 local hrp = character and character:FindFirstChild("HumanoidRootPart")
                 if not hrp then continue end
@@ -2382,16 +2667,16 @@ task.spawn(function()
 end)
 
 
--- ====== [THREAD 1.75]: AUTO PELLET MACHINE PERFECT LOGIC ======
+-- ====== [THREAD 1.75]: AUTO PELLET MACHINE - 4x FAST CYCLE / INVADER'S ONLY ======
 local function clickTargetUI(targetButton)
     if targetButton and targetButton.Visible and targetButton.AbsoluteSize.X > 0 then
         local absPos = targetButton.AbsolutePosition
         local absSize = targetButton.AbsoluteSize
         local inset = GuiService:GetGuiInset()
-        
+
         local clickX = absPos.X + (absSize.X / 2)
         local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
-        
+
         pcall(function()
             VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1)
             task.wait(0.05)
@@ -2404,13 +2689,13 @@ end
 
 local function findCloseButton(uiContainer)
     local candidates = {}
-    
+
     for _, gui in pairs(uiContainer:GetDescendants()) do
         if gui:IsA("GuiButton") and gui.Visible and gui.AbsoluteSize.X > 0 then
             table.insert(candidates, gui)
         end
     end
-    
+
     for _, gui in ipairs(candidates) do
         local name = string.lower(gui.Name)
         local txt = gui:IsA("TextButton") and string.lower(gui.Text or "") or ""
@@ -2418,37 +2703,44 @@ local function findCloseButton(uiContainer)
             return gui
         end
     end
-    
+
     local bestGuess = nil
     local highestScore = -math.huge
-    
+
     for _, gui in ipairs(candidates) do
         local absSize = gui.AbsoluteSize
         local absPos = gui.AbsolutePosition
-        
+
         local ratio = math.max(absSize.X, absSize.Y) / math.max(1, math.min(absSize.X, absSize.Y))
         if ratio <= 2.5 and absSize.X < 90 and absSize.Y < 90 then
-            local score = absPos.X - (absPos.Y * 3) 
+            local score = absPos.X - (absPos.Y * 3)
             if score > highestScore then
                 highestScore = score
                 bestGuess = gui
             end
         end
     end
-    
+
     return bestGuess
 end
 
 local function firePelletPrompt()
     local fired = false
+
     for _, desc in pairs(workspace:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
             local parentPart = desc.Parent
             local isNear = true
+
             if parentPart and parentPart:IsA("BasePart") then
                 isNear = (parentPart.Position - spotKordinat.PelletMachine.Position).Magnitude < 25
             end
-            if isNear and (string.find(string.lower(desc.ObjectText or ""), "pellet") or string.find(string.lower(desc.ActionText or ""), "use") or string.find(string.lower(desc.ObjectText or ""), "machine")) then
+
+            if isNear and (
+                string.find(string.lower(desc.ObjectText or ""), "pellet")
+                or string.find(string.lower(desc.ActionText or ""), "use")
+                or string.find(string.lower(desc.ObjectText or ""), "machine")
+            ) then
                 if fireproximityprompt then
                     fireproximityprompt(desc)
                     fired = true
@@ -2456,25 +2748,29 @@ local function firePelletPrompt()
             end
         end
     end
-    
+
     if not fired then
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-        task.wait(0.2)
+        task.wait(0.15)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
     end
 end
 
+-- Mesin/UI logic existing dipertahankan: feed sampai state mesin selesai,
+-- lalu close ketika Full / Not Enough. Di akhir cycle kita juga force-close
+-- jika UI masih terbuka.
 local function processFeedMachineAndClose()
+    local feedResult = "FEEDING"
     for attempt = 1, 6 do
         local targetFeedButton = nil
         local isFull = false
         local isNotEnough = false
         local mainUIContainer = nil
-        
+
         for _, gui in pairs(player.PlayerGui:GetDescendants()) do
             if (gui:IsA("TextLabel") or gui:IsA("TextButton")) and gui.Visible then
                 local txt = string.lower(gui.Text or "")
-                
+
                 if string.find(txt, "ghost slots full") then
                     isFull = true
                     local parent = gui
@@ -2503,115 +2799,325 @@ local function processFeedMachineAndClose()
                 end
             end
         end
-        
+
         if isFull then
-            if UIStatus_Pellet then 
-                UIStatus_Pellet.Text = "STATUS: MESIN FULL! CLOSING..." 
-                UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 100, 100) 
+            if UIStatus_Pellet then
+                UIStatus_Pellet.Text = "STATUS: MESIN FULL! CLOSING..."
+                UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 100, 100)
             end
-            task.wait(0.5)
-            
+            NotifyToast("Pellet Machine", "mesin FULL • UI ditutup", "info")
+            feedResult = "FULL"
+            task.wait(0.25)
+
             local closeButton = findCloseButton(mainUIContainer or player.PlayerGui)
             if closeButton then
                 clickTargetUI(closeButton)
-                task.wait(0.5)
+                task.wait(0.35)
             end
             break
         end
 
         if isNotEnough then
-            if UIStatus_Pellet then 
-                UIStatus_Pellet.Text = "STATUS: PELLET TIDAK CUKUP! CLOSING..." 
-                UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 150, 50) 
+            if UIStatus_Pellet then
+                UIStatus_Pellet.Text = "STATUS: PELLET TIDAK CUKUP! CLOSING..."
+                UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 150, 50)
             end
-            task.wait(0.5)
-            
+            NotifyToast("Pellet Machine", "pellet tidak cukup • UI ditutup", "error")
+            feedResult = "NOT_ENOUGH"
+            task.wait(0.25)
+
             local closeButton = findCloseButton(mainUIContainer or player.PlayerGui)
             if closeButton then
                 clickTargetUI(closeButton)
-                task.wait(0.5)
+                task.wait(0.35)
             end
             break
         end
-        
+
         if targetFeedButton then
-            if UIStatus_Pellet then 
-                UIStatus_Pellet.Text = "STATUS: FEEDING MACHINE (" .. attempt .. "/6)" 
-                UIStatus_Pellet.TextColor3 = Color3.fromRGB(50, 255, 100) 
+            if UIStatus_Pellet then
+                UIStatus_Pellet.Text = "STATUS: FEEDING MACHINE (" .. attempt .. "/6)"
+                UIStatus_Pellet.TextColor3 = Color3.fromRGB(50, 255, 100)
             end
             clickTargetUI(targetFeedButton)
+            if attempt == 1 then
+                NotifyToast("Pellet Machine", "Feed Machine berhasil dijalankan", "success")
+            end
             task.wait(1.5)
         else
-            task.wait(0.5)
+            task.wait(0.35)
         end
     end
+
+    -- User wants every 1x cycle to end with the UI closed.
+    task.wait(0.15)
+    local closeButton = findCloseButton(player.PlayerGui)
+    if closeButton then
+        clickTargetUI(closeButton)
+        NotifyToast("Pellet Machine", "UI berhasil ditutup", "success")
+        task.wait(0.35)
+    end
+    return feedResult
+end
+
+-- One complete pellet-machine cycle:
+-- 1) TP machine -> 2) open UI with E -> 3) immediately TP to final position
+-- 4) Feed Machine -> 5) close UI.
+ExecutePelletCycle = function(isManual)
+    if isPelletExecuting or isLifeMachineExecuting or arcadiaEventActive then
+        return false
+    end
+    -- If another system owns the teleport lock, Pellet waits. Otherwise Pellet takes it.
+    if teleportLockOwner and teleportLockOwner ~= "PELLET" then
+        return false
+    end
+    local acquiredPelletTeleportLock = false
+
+    local character = player.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        return false
+    end
+
+    -- Auto is restricted to Invader's. Manual intentionally bypasses this.
+    if not isManual then
+        local distToInvaderMap = (hrp.Position - invaderPos).Magnitude
+        if distToInvaderMap > 350 then
+            return false
+        end
+    end
+
+    if not teleportLockOwner then
+        teleportLockOwner = "PELLET"
+        acquiredPelletTeleportLock = true
+    end
+    isPelletExecuting = true
+    local originalCFrame = hrp.CFrame
+
+    local ok, err = pcall(function()
+        -- STEP 1: TP pellet machine.
+        if UIStatus_Pellet then
+            UIStatus_Pellet.Text = isManual and "MANUAL: MENUJU MESIN PELLET" or "AUTO: MENUJU MESIN PELLET"
+            UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 200, 50)
+        end
+
+        hrp.CFrame = spotKordinat.PelletMachine
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        NotifyToast("Pellet Machine", "berhasil TP ke mesin", "success")
+        -- Give Invader's -> Arcadia streaming/rendering time to finish before E.
+        task.wait(1.50)
+
+        -- STEP 2: Open the pellet UI.
+        if UIStatus_Pellet then
+            UIStatus_Pellet.Text = "STATUS: MENGAKTIFKAN MESIN (E)"
+            UIStatus_Pellet.TextColor3 = Color3.fromRGB(100, 255, 255)
+        end
+
+        firePelletPrompt()
+        NotifyToast("Pellet Machine", "ProximityPrompt / E berhasil", "success")
+        task.wait(0.45)
+
+        -- STEP 3: Return to the character's original/final position.
+        -- IMPORTANT: this is NOT Arcadia. The Pellet UI remains open, so the
+        -- Feed Machine can be processed from wherever the character started.
+        if UIStatus_Pellet then
+            UIStatus_Pellet.Text = "STATUS: KEMBALI KE POSISI AWAL"
+            UIStatus_Pellet.TextColor3 = Color3.fromRGB(100, 255, 255)
+        end
+
+        hrp.CFrame = originalCFrame
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        NotifyToast("Pellet Machine", "berhasil kembali ke posisi awal", "success")
+        task.wait(0.25)
+
+        -- STEP 4 + 5: Existing Feed Machine logic, then close.
+        local feedResult = processFeedMachineAndClose()
+        if feedResult == "FEEDING" then
+            NotifyToast("Pellet Machine", "cycle feeding selesai", "success")
+        end
+    end)
+
+    -- Safety: never leave the UI open after a cycle if a close button exists.
+    if player.PlayerGui then
+        task.wait(0.1)
+        local closeButton = findCloseButton(player.PlayerGui)
+        if closeButton then
+            clickTargetUI(closeButton)
+            task.wait(0.25)
+        end
+    end
+
+    -- Return to the position from which the 4x batch started.
+    character = player.Character
+    hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if hrp and originalCFrame then
+        hrp.CFrame = originalCFrame
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    end
+
+    if ConfigData.AutoFishingToggle then
+        forceFarmTP = true
+    end
+
+    isPelletExecuting = false
+    if acquiredPelletTeleportLock and teleportLockOwner == "PELLET" then
+        teleportLockOwner = nil
+    end
+
+    if not ok then
+        if UIStatus_Pellet then
+            UIStatus_Pellet.Text = "STATUS: CYCLE ERROR, RETRY NEXT"
+            UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 100, 100)
+        end
+        NotifyToast("Pellet Machine", "cycle gagal • akan retry", "error")
+        return false, err
+    end
+
+    return true
 end
 
 task.spawn(function()
     while true do
-        task.wait(1)
-        if ConfigData.AutoPellet and not isPelletExecuting and not isLifeMachineExecuting and not arcadiaEventActive then
-            local character = player.Character
-            local hrp = character and character:FindFirstChild("HumanoidRootPart")
-            if not hrp then continue end
-            
-            isPelletExecuting = true
-            local originalCFrame = hrp.CFrame
-            
-            -- LANGKAH 1: Teleport ke Mesin Pellet
-            if UIStatus_Pellet then 
-                UIStatus_Pellet.Text = "STATUS: MENUJU MESIN PELLET" 
-                UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 200, 50) 
+        task.wait(0.25)
+
+        local character = player.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+
+        if not ConfigData.AutoPellet then
+            pelletAutoInsideInvader = false
+            pelletAutoStartAt = 0
+            continue
+        end
+
+        if not hrp then
+            continue
+        end
+
+        -- Auto can only START while physically inside Invader's.
+        local distToInvaderMap = (hrp.Position - invaderPos).Magnitude
+        local insideInvader = distToInvaderMap <= 350
+
+        if not insideInvader then
+            pelletAutoInsideInvader = false
+            pelletAutoStartAt = 0
+
+            if not isPelletExecuting and UIStatus_Pellet then
+                UIStatus_Pellet.Text = "AUTO PELLET: MENUNGGU INVADER'S"
+                UIStatus_Pellet.TextColor3 = c_subtext
             end
-            hrp.CFrame = spotKordinat.PelletMachine
-            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            task.wait(1.5)
-            
-            -- LANGKAH 2: Eksekusi ProximityPrompt Mesin ("E")
-            if UIStatus_Pellet then 
-                UIStatus_Pellet.Text = "STATUS: MENGAKTIFKAN MESIN (E)" 
-                UIStatus_Pellet.TextColor3 = Color3.fromRGB(100, 255, 255) 
+
+            continue
+        end
+
+        -- Detect arrival/entry into Invader's and arm the required 15s delay.
+        if not pelletAutoInsideInvader then
+            pelletAutoInsideInvader = true
+            pelletAutoStartAt = os.clock() + 15
+
+            if UIStatus_Pellet then
+                UIStatus_Pellet.Text = "AUTO PELLET: TUNGGU 15 DETIK DI INVADER'S"
+                UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 200, 50)
             end
-            firePelletPrompt()
-            task.wait(3)
-            
-            -- LANGKAH 3: Loop Feed, Deteksi Kurang Pellet, & Auto Close
-            processFeedMachineAndClose()
-            
-            -- LANGKAH 4: Jeda & Kembali ke Posisi Awal
-            if UIStatus_Pellet then 
-                UIStatus_Pellet.Text = "STATUS: SIKLUS SELESAI, KEMBALI..." 
-                UIStatus_Pellet.TextColor3 = Color3.fromRGB(100, 255, 100) 
+            NotifyToast("Pellet Machine", "masuk Invader's • start dalam 15 detik", "info")
+        end
+
+        if os.clock() < pelletAutoStartAt then
+            continue
+        end
+
+        if isPelletExecuting or isLifeMachineExecuting or arcadiaEventActive then
+            continue
+        end
+
+        -- One batch = exactly 4 complete cycles.
+        -- Hold teleport priority for the entire 4-cycle batch, including the 5s gaps.
+        if teleportLockOwner and teleportLockOwner ~= "PELLET" then
+            continue
+        end
+        teleportLockOwner = "PELLET"
+        local batchCharacter = player.Character
+        local batchHRP = batchCharacter and batchCharacter:FindFirstChild("HumanoidRootPart")
+        local originalCFrame = batchHRP and batchHRP.CFrame
+
+        local batchOK = true
+
+        for cycle = 1, 4 do
+            if not ConfigData.AutoPellet then
+                batchOK = false
+                break
             end
-            task.wait(4)
-            
-            if character and character:FindFirstChild("HumanoidRootPart") then
-                character.HumanoidRootPart.CFrame = originalCFrame
-                character.HumanoidRootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+
+            if UIStatus_Pellet then
+                UIStatus_Pellet.Text = string.format("AUTO PELLET: SIKLUS %d/4", cycle)
+                UIStatus_Pellet.TextColor3 = Color3.fromRGB(50, 255, 100)
             end
-            if ConfigData.AutoFishingToggle then forceFarmTP = true end
-            
-            -- LANGKAH 5: Cooldown / Idle selama 30 Menit (1800 Detik)
-            local pelletCooldown = 1800
-            while pelletCooldown > 0 and ConfigData.AutoPellet do
+            NotifyToast("Pellet Machine", string.format("siklus %d/4 dimulai", cycle), "info")
+
+            -- Execute the inner cycle while holding the batch lock.
+            isPelletExecuting = false
+            local ok = ExecutePelletCycle(false)
+            if not ok then
+                batchOK = false
+                break
+            end
+
+            -- 5s only BETWEEN cycles, not before the final cooldown.
+            if cycle < 4 then
                 if UIStatus_Pellet then
-                    local m = math.floor(pelletCooldown / 60)
-                    local s = pelletCooldown % 60
-                    UIStatus_Pellet.Text = string.format("PELLET COOLDOWN: %02dm %02ds", m, s)
+                    UIStatus_Pellet.Text = string.format("AUTO PELLET: JEDA %ds (%d/4)", 5, cycle)
                     UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 200, 50)
                 end
-                task.wait(1)
-                pelletCooldown = pelletCooldown - 1
+                NotifyToast("Pellet Machine", string.format("siklus %d selesai • jeda 5 detik", cycle), "info")
+                task.wait(5)
             end
-            
-            if UIStatus_Pellet and ConfigData.AutoPellet then 
-                UIStatus_Pellet.Text = "AUTO PELLET: ON (MENUNGGU SIKLUS)" 
-                UIStatus_Pellet.TextColor3 = Color3.fromRGB(50, 255, 100) 
-            end
-            
-            isPelletExecuting = false
-            task.wait(1)
         end
+
+        -- Ensure batch lock is released and return to the batch-start position.
+        batchCharacter = player.Character
+        batchHRP = batchCharacter and batchCharacter:FindFirstChild("HumanoidRootPart")
+        if batchHRP and originalCFrame then
+            batchHRP.CFrame = originalCFrame
+            batchHRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end
+
+        isPelletExecuting = false
+        if teleportLockOwner == "PELLET" then
+            teleportLockOwner = nil
+        end
+
+        if not batchOK then
+            if UIStatus_Pellet and ConfigData.AutoPellet then
+                UIStatus_Pellet.Text = "AUTO PELLET: BATCH BERHENTI / MENUNGGU INVADER'S"
+                UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 150, 50)
+            end
+            task.wait(1)
+            continue
+        end
+
+        NotifyToast("Pellet Machine", "4/4 sukses • cooldown 30 menit dimulai", "success")
+
+        -- 30-minute cooldown starts ONLY after the 4th cycle.
+        local pelletCooldown = 1800
+        while pelletCooldown > 0 and ConfigData.AutoPellet do
+            if UIStatus_Pellet then
+                local m = math.floor(pelletCooldown / 60)
+                local sec = pelletCooldown % 60
+                UIStatus_Pellet.Text = string.format("PELLET COOLDOWN: %02dm %02ds", m, sec)
+                UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 200, 50)
+            end
+
+            task.wait(1)
+            pelletCooldown = pelletCooldown - 1
+        end
+
+        if UIStatus_Pellet and ConfigData.AutoPellet then
+            UIStatus_Pellet.Text = "AUTO PELLET: ON (MENUNGGU SIKLUS)"
+            UIStatus_Pellet.TextColor3 = Color3.fromRGB(50, 255, 100)
+        end
+
+        -- Re-arm the 15s gate only when the player enters Invader's again.
+        pelletAutoInsideInvader = false
+        pelletAutoStartAt = 0
     end
 end)
 
@@ -2624,7 +3130,7 @@ task.spawn(function()
             local hrp = character and character:FindFirstChild("HumanoidRootPart")
             
             -- Jangan ganggu Event/Pellet/Life Machine jika sedang sibuk teleport
-            local isEventActive = (isWeatherTPBusy or isArcadiaTPBusy or arcadiaEventActive or isPelletExecuting or isLifeMachineExecuting)
+            local isEventActive = (isWeatherTPBusy or isArcadiaTPBusy or arcadiaEventActive or isPelletExecuting or isLifeMachineExecuting or teleportLockOwner == "PELLET")
 
             if hrp then
                 if ConfigData.SelectedFarmingMode == "Map 1 (Throne Room)" then
@@ -2635,6 +3141,7 @@ task.spawn(function()
                         ConfigData.DualMapSubTimer = 0
                         ConfigData.DualMapPoolIndex = (ConfigData.DualMapPoolIndex % #poolAngles) + 1
                         SaveConfig()
+                        NotifyToast("Auto Fishing", string.format("rotate %d/%d siap", ConfigData.DualMapPoolIndex, #poolAngles), "info")
                         forceFarmTP = true
                     end
                     
@@ -2642,6 +3149,7 @@ task.spawn(function()
                         local currentAngle = poolAngles[ConfigData.DualMapPoolIndex] or poolAngles[1]
                         hrp.CFrame = CFrame.new(standPositionRot) * CFrame.Angles(0, math.rad(currentAngle), 0)
                         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        NotifyToast("Auto Fishing", string.format("berhasil rotate %d/%d", ConfigData.DualMapPoolIndex, #poolAngles), "success")
                         forceFarmTP = false
                     end
                     
@@ -2657,6 +3165,7 @@ task.spawn(function()
                     if not isEventActive and forceFarmTP then
                         hrp.CFrame = map2CFrame
                         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        NotifyToast("Auto Fishing", "berhasil TP ke Canyon", "success")
                         forceFarmTP = false
                     end
 
@@ -2692,9 +3201,11 @@ task.spawn(function()
                     if not isEventActive and forceFarmTP then
                         if ConfigData.FarmMapCurrent == "Canyon" then
                             hrp.CFrame = map2CFrame
+                            NotifyToast("Auto Fishing", "berhasil TP ke Canyon", "success")
                         else
                             local currentAngle = poolAngles[ConfigData.DualMapPoolIndex] or poolAngles[1]
                             hrp.CFrame = CFrame.new(standPositionRot) * CFrame.Angles(0, math.rad(currentAngle), 0)
+                            NotifyToast("Auto Fishing", string.format("berhasil rotate %d/%d", ConfigData.DualMapPoolIndex, #poolAngles), "success")
                         end
                         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                         forceFarmTP = false
@@ -2740,11 +3251,14 @@ task.spawn(function()
                     if not isEventActive and forceFarmTP then
                         if ConfigData.FarmMapCurrent == "Canyon" then
                             hrp.CFrame = map2CFrame
+                            NotifyToast("Auto Fishing", "berhasil TP ke Canyon", "success")
                         elseif ConfigData.FarmMapCurrent == "Invader" then
                             hrp.CFrame = invaderCFrame
+                            NotifyToast("Auto Fishing", "berhasil TP ke Invader's", "success")
                         else
                             local currentAngle = poolAngles[ConfigData.DualMapPoolIndex] or poolAngles[1]
                             hrp.CFrame = CFrame.new(standPositionRot) * CFrame.Angles(0, math.rad(currentAngle), 0)
+                            NotifyToast("Auto Fishing", string.format("berhasil rotate %d/%d", ConfigData.DualMapPoolIndex, #poolAngles), "success")
                         end
                         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                         forceFarmTP = false
