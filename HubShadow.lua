@@ -56,6 +56,7 @@ local DefaultConfig = {
     DualMapTimer = 0,
     DualMapSubTimer = 0,
     DualMapPoolIndex = 1,
+    TripleMapSwapDeadline = 0, -- Unix timestamp; keeps Triple Map cooldown across disconnect/rejoin
     
     StaffDetector = false,
     AutoReconnect = false,
@@ -1707,6 +1708,7 @@ local BtnResetDualMap = CreateButton(DropFishing, "🔄 Reset Farm State", funct
     ConfigData.DualMapTimer = 0
     ConfigData.DualMapSubTimer = 0
     ConfigData.DualMapPoolIndex = 1
+    ConfigData.TripleMapSwapDeadline = 0
     forceFarmTP = true
     SaveConfig()
     BtnResetDualMap.Text = "✅ Farm State Kembali Default!"
@@ -3228,9 +3230,24 @@ task.spawn(function()
                     end
 
                 elseif ConfigData.SelectedFarmingMode == "Triple Map (Canyon, Throne, Hallows Eve)" then
-                    ConfigData.DualMapTimer = ConfigData.DualMapTimer + 1
-                    if ConfigData.DualMapTimer >= dualMapInterval then
-                        ConfigData.DualMapTimer = 0
+                    -- Use a saved Unix deadline instead of a per-session counter.
+                    -- os.time() continues advancing while Roblox/executor is disconnected.
+                    local now = os.time()
+                    local swapDeadline = tonumber(ConfigData.TripleMapSwapDeadline) or 0
+
+                    -- One-time migration: preserve any elapsed progress available in the old counter.
+                    if swapDeadline <= 0 then
+                        local oldElapsed = math.max(0, tonumber(ConfigData.DualMapTimer) or 0)
+                        local remaining = math.max(1, dualMapInterval - oldElapsed)
+                        swapDeadline = now + remaining
+                        ConfigData.TripleMapSwapDeadline = swapDeadline
+                        SaveConfig()
+                    end
+
+                    local sisaDual = math.max(0, swapDeadline - now)
+                    ConfigData.DualMapTimer = math.max(0, dualMapInterval - sisaDual)
+
+                    if sisaDual <= 0 then
                         if ConfigData.FarmMapCurrent == "Canyon" then
                             ConfigData.FarmMapCurrent = "Throne"
                             ConfigData.DualMapPoolIndex = 1
@@ -3239,8 +3256,13 @@ task.spawn(function()
                         else
                             ConfigData.FarmMapCurrent = "Canyon"
                         end
+
+                        -- Start the next interval at the actual transition time and persist it.
+                        ConfigData.DualMapTimer = 0
+                        ConfigData.TripleMapSwapDeadline = now + dualMapInterval
                         SaveConfig()
                         forceFarmTP = true
+                        sisaDual = dualMapInterval
                     end
                     
                     if ConfigData.FarmMapCurrent == "Throne" then
@@ -3269,7 +3291,6 @@ task.spawn(function()
                         forceFarmTP = false
                     end
                     
-                    local sisaDual = dualMapInterval - ConfigData.DualMapTimer
                     if UIStatus_Fishing then
                         if ConfigData.FarmMapCurrent == "Canyon" then
                             UIStatus_Fishing.Text = string.format("TRIPLE MAP (CANYON): SWAP IN %s", formatSecondsToText(sisaDual))
