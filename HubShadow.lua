@@ -102,6 +102,8 @@ local function LoadConfig()
                 ConfigData.SelectedFarmingMode = "Map 1 (Throne Room)"
             elseif ConfigData.SelectedFarmingMode == "Dual Map (Switch)" then
                 ConfigData.SelectedFarmingMode = "Dual Map (Canyon, Throne)"
+            elseif ConfigData.SelectedFarmingMode == "Triple Map (Canyon, Throne, Invader's)" then
+                ConfigData.SelectedFarmingMode = "Triple Map (Canyon, Throne, Hallows Eve)"
             end
         end)
     end
@@ -228,7 +230,7 @@ local isLifeMachineExecuting = false
 -- Teleport priority lock: Pellet owns teleport control during its 4-cycle batch.
 local teleportLockOwner = nil
 local ExecutePelletCycle -- forward declaration for the manual trigger
-local pelletAutoInsideInvader = false
+local pelletAutoInsideHallowsEve = false
 local pelletAutoStartAt = 0
 -- Shared priority flag: dideklarasikan sebelum semua thread agar weather/farm/machine
 -- dapat menghormati event Kraken sebagai prioritas tertinggi.
@@ -244,9 +246,9 @@ local map2Pos = Vector3.new(-4014.58, -543.00, 564.95)
 local map2Degree = 46.85
 local map2CFrame = CFrame.new(map2Pos) * CFrame.Angles(0, math.rad(map2Degree), 0)
 
--- UPDATE KOORDINAT INVADER TERBARU
-local invaderPos = Vector3.new(1360.69, -960.90, 2977.51)
-local invaderDegree = 158.26
+-- MAP PENGGANTI INVADER: HALLOWS EVE (koordinat + arah dari Pencatat Koordinat)
+local invaderPos = Vector3.new(576.10, 1901.81, -5606.48)
+local invaderDegree = 1.59
 local invaderCFrame = CFrame.new(invaderPos) * CFrame.Angles(0, math.rad(invaderDegree), 0)
 
 -- LIFE MACHINE TRIGGER V5: EXACT COORDINATE + CAMERA-INDEPENDENT PROMPT
@@ -502,10 +504,10 @@ local function ExecuteLifeMachine(UIStatus_LifeMachine, isManual)
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     if not hrp then return false end
 
-    -- Auto mode tetap khusus Invader's Reach.
+    -- Auto mode tetap khusus Hallows Eve Reach.
     if not isManual then
-        local distToInvaderMap = (hrp.Position - invaderPos).Magnitude
-        if distToInvaderMap > 350 then
+        local distToHallowsEveMap = (hrp.Position - invaderPos).Magnitude
+        if distToHallowsEveMap > 350 then
             return false
         end
     end
@@ -1411,7 +1413,8 @@ local function CreateTab(name, active)
     return PageScroll
 end
 
-local TabAutomation   = CreateTab("⚡ Automation", true)
+CreateTab("🏠 MAIN", true) -- MAIN page registered in Pages to avoid an extra top-level local
+local TabAutomation   = CreateTab("⚡ Automation", false)
 local TabArcadiaEvent = CreateTab("🎪 EVENT ARCADIA", false)
 local TabBooster      = CreateTab("🚀 Booster & RAM", false)
 local TabWebhooks     = CreateTab("📡 Discord Webhooks", false)
@@ -1614,8 +1617,14 @@ local function CreateInfoLabel(parent, text)
 end
 
 -- ========================================================
--- 6. MENU SETUP (AUTOMATION, ARCADIA, BOOSTER, WEBHOOKS, TELEPORT)
+-- 6. MENU SETUP (MAIN, AUTOMATION, ARCADIA, BOOSTER, WEBHOOKS, TELEPORT)
 -- ========================================================
+do
+    local mainInfoDropdown = CreateDropdown(Pages["🏠 MAIN"].Frame, "🏠 Welcome to Shadow Hub")
+    CreateInfoLabel(mainInfoDropdown, "Shadow Hub V8 - MAIN Menu")
+    CreateInfoLabel(mainInfoDropdown, "Silakan pilih fitur yang tersedia pada sidebar di sebelah kiri.")
+end
+
 local DropElemental = CreateDropdown(TabAutomation, "Event Elemental TP")
 local UIStatus_Elemental = CreateStatusLabel(DropElemental)
 CreateToggle(DropElemental, "Enable Auto TP Cuaca", "AutoTP", function(state)
@@ -1661,7 +1670,7 @@ BtnTPArcadiaManual.BackgroundColor3 = c_sidebar; BtnTPArcadiaManual.TextColor3 =
 BtnTPArcadiaManual:SetAttribute("ThemeRole", "accent_text"); Instance.new("UIStroke", BtnTPArcadiaManual).Color = c_accent
 
 local DropFishing = CreateDropdown(TabAutomation, "🎣 Auto Fishing Manager")
-local fishingModes = {"Map 1 (Throne Room)", "Map 2 (Canyon)", "Dual Map (Canyon, Throne)", "Triple Map (Canyon, Throne, Invader's)"}
+local fishingModes = {"Map 1 (Throne Room)", "Map 2 (Canyon)", "Dual Map (Canyon, Throne)", "Triple Map (Canyon, Throne, Hallows Eve)"}
 local FishingSelectorFrame, FishingPopulate, FishingSelectBtn = CreateSelector(DropFishing, "Farming Mode", fishingModes, function(sel)
     ConfigData.SelectedFarmingMode = sel
     SaveConfig()
@@ -1687,9 +1696,9 @@ local BtnManualTPCanyon = CreateButton(DropFishing, "📌 Manual TP ke Canyon", 
     if hrp then hrp.CFrame = map2CFrame; hrp.AssemblyLinearVelocity = Vector3.new(0,0,0); return "berhasil TP ke Canyon" end
     return false
 end)
-local BtnManualTPInvader = CreateButton(DropFishing, "📌 Manual TP ke Invader's", function()
+local BtnManualTPHallowsEve = CreateButton(DropFishing, "📌 Manual TP ke Hallows Eve", function()
     local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-    if hrp then hrp.CFrame = invaderCFrame; hrp.AssemblyLinearVelocity = Vector3.new(0,0,0); return "berhasil TP ke Invader's" end
+    if hrp then hrp.CFrame = invaderCFrame; hrp.AssemblyLinearVelocity = Vector3.new(0,0,0); return "berhasil TP ke Hallows Eve" end
     return false
 end)
 
@@ -1722,14 +1731,14 @@ end
 
 CreateToggle(DropPellet, "Enable Auto Pellet Machine", "AutoPellet", function(state)
     if state then
-        UIStatus_Pellet.Text = "AUTO PELLET: ON (MENUNGGU INVADER'S)"
+        UIStatus_Pellet.Text = "AUTO PELLET: ON (MENUNGGU HALLOWS EVE)"
         UIStatus_Pellet.TextColor3 = Color3.fromRGB(50, 255, 100)
-        pelletAutoInsideInvader = false
+        pelletAutoInsideHallowsEve = false
         pelletAutoStartAt = 0
     else
         UIStatus_Pellet.Text = "AUTO PELLET: OFF"
         UIStatus_Pellet.TextColor3 = c_subtext
-        pelletAutoInsideInvader = false
+        pelletAutoInsideHallowsEve = false
         pelletAutoStartAt = 0
     end
 end)
@@ -1885,13 +1894,9 @@ local BtnSaveLoc = CreateButton(DropSavedTP, "Save Current Location", function()
     else
         BtnSaveLoc.Text = "Player Not Found!"
         BtnSaveLoc.TextColor3 = Color3.fromRGB(255, 100, 100)
+        return "pemain tidak ditemukan"
     end
-    task.delay(2, function()
-        BtnSaveLoc.Text = "Save Current Location"
-        BtnSaveLoc.TextColor3 = c_text
-    end)
 end)
-
 local BtnTeleportLoc = CreateButton(DropSavedTP, "Teleport to Saved", function()
     -- Refresh dari ConfigData juga agar data tetap menjadi sumber kebenaran.
     if not savedCustomLocation then
@@ -2647,9 +2652,9 @@ task.spawn(function()
                     -- kemunculan Extra Life berikutnya.
                     lifeExtraLifeUIArmed = true
                 elseif lifeExtraLifeUIArmed then
-                    local distToInvaderMap = (hrp.Position - invaderPos).Magnitude
+                    local distToHallowsEveMap = (hrp.Position - invaderPos).Magnitude
 
-                    if distToInvaderMap < 350 then
+                    if distToHallowsEveMap < 350 then
                         -- Disarm SEBELUM teleport supaya popup yang sama
                         -- tidak menyebabkan perjalanan 2-3 kali.
                         lifeExtraLifeUIArmed = false
@@ -2667,7 +2672,7 @@ task.spawn(function()
 end)
 
 
--- ====== [THREAD 1.75]: AUTO PELLET MACHINE - 4x FAST CYCLE / INVADER'S ONLY ======
+-- ====== [THREAD 1.75]: AUTO PELLET MACHINE - 4x FAST CYCLE / HALLOWS EVE ONLY ======
 local function clickTargetUI(targetButton)
     if targetButton and targetButton.Visible and targetButton.AbsoluteSize.X > 0 then
         local absPos = targetButton.AbsolutePosition
@@ -2879,10 +2884,10 @@ ExecutePelletCycle = function(isManual)
         return false
     end
 
-    -- Auto is restricted to Invader's. Manual intentionally bypasses this.
+    -- Auto is restricted to Hallows Eve. Manual intentionally bypasses this.
     if not isManual then
-        local distToInvaderMap = (hrp.Position - invaderPos).Magnitude
-        if distToInvaderMap > 350 then
+        local distToHallowsEveMap = (hrp.Position - invaderPos).Magnitude
+        if distToHallowsEveMap > 350 then
             return false
         end
     end
@@ -2904,7 +2909,7 @@ ExecutePelletCycle = function(isManual)
         hrp.CFrame = spotKordinat.PelletMachine
         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         NotifyToast("Pellet Machine", "berhasil TP ke mesin", "success")
-        -- Give Invader's -> Arcadia streaming/rendering time to finish before E.
+        -- Give Hallows Eve -> Arcadia streaming/rendering time to finish before E.
         task.wait(1.50)
 
         -- STEP 2: Open the pellet UI.
@@ -2984,7 +2989,7 @@ task.spawn(function()
         local hrp = character and character:FindFirstChild("HumanoidRootPart")
 
         if not ConfigData.AutoPellet then
-            pelletAutoInsideInvader = false
+            pelletAutoInsideHallowsEve = false
             pelletAutoStartAt = 0
             continue
         end
@@ -2993,32 +2998,32 @@ task.spawn(function()
             continue
         end
 
-        -- Auto can only START while physically inside Invader's.
-        local distToInvaderMap = (hrp.Position - invaderPos).Magnitude
-        local insideInvader = distToInvaderMap <= 350
+        -- Auto can only START while physically inside Hallows Eve.
+        local distToHallowsEveMap = (hrp.Position - invaderPos).Magnitude
+        local insideHallowsEve = distToHallowsEveMap <= 350
 
-        if not insideInvader then
-            pelletAutoInsideInvader = false
+        if not insideHallowsEve then
+            pelletAutoInsideHallowsEve = false
             pelletAutoStartAt = 0
 
             if not isPelletExecuting and UIStatus_Pellet then
-                UIStatus_Pellet.Text = "AUTO PELLET: MENUNGGU INVADER'S"
+                UIStatus_Pellet.Text = "AUTO PELLET: MENUNGGU HALLOWS EVE"
                 UIStatus_Pellet.TextColor3 = c_subtext
             end
 
             continue
         end
 
-        -- Detect arrival/entry into Invader's and arm the required 15s delay.
-        if not pelletAutoInsideInvader then
-            pelletAutoInsideInvader = true
+        -- Detect arrival/entry into Hallows Eve and arm the required 15s delay.
+        if not pelletAutoInsideHallowsEve then
+            pelletAutoInsideHallowsEve = true
             pelletAutoStartAt = os.clock() + 15
 
             if UIStatus_Pellet then
-                UIStatus_Pellet.Text = "AUTO PELLET: TUNGGU 15 DETIK DI INVADER'S"
+                UIStatus_Pellet.Text = "AUTO PELLET: TUNGGU 15 DETIK DI HALLOWS EVE"
                 UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 200, 50)
             end
-            NotifyToast("Pellet Machine", "masuk Invader's • start dalam 15 detik", "info")
+            NotifyToast("Pellet Machine", "masuk Hallows Eve • start dalam 15 detik", "info")
         end
 
         if os.clock() < pelletAutoStartAt then
@@ -3087,7 +3092,7 @@ task.spawn(function()
 
         if not batchOK then
             if UIStatus_Pellet and ConfigData.AutoPellet then
-                UIStatus_Pellet.Text = "AUTO PELLET: BATCH BERHENTI / MENUNGGU INVADER'S"
+                UIStatus_Pellet.Text = "AUTO PELLET: BATCH BERHENTI / MENUNGGU HALLOWS EVE"
                 UIStatus_Pellet.TextColor3 = Color3.fromRGB(255, 150, 50)
             end
             task.wait(1)
@@ -3115,8 +3120,8 @@ task.spawn(function()
             UIStatus_Pellet.TextColor3 = Color3.fromRGB(50, 255, 100)
         end
 
-        -- Re-arm the 15s gate only when the player enters Invader's again.
-        pelletAutoInsideInvader = false
+        -- Re-arm the 15s gate only when the player enters Hallows Eve again.
+        pelletAutoInsideHallowsEve = false
         pelletAutoStartAt = 0
     end
 end)
@@ -3222,7 +3227,7 @@ task.spawn(function()
                         UIStatus_Fishing.TextColor3 = Color3.fromRGB(50, 255, 100)
                     end
 
-                elseif ConfigData.SelectedFarmingMode == "Triple Map (Canyon, Throne, Invader's)" then
+                elseif ConfigData.SelectedFarmingMode == "Triple Map (Canyon, Throne, Hallows Eve)" then
                     ConfigData.DualMapTimer = ConfigData.DualMapTimer + 1
                     if ConfigData.DualMapTimer >= dualMapInterval then
                         ConfigData.DualMapTimer = 0
@@ -3230,7 +3235,7 @@ task.spawn(function()
                             ConfigData.FarmMapCurrent = "Throne"
                             ConfigData.DualMapPoolIndex = 1
                         elseif ConfigData.FarmMapCurrent == "Throne" then
-                            ConfigData.FarmMapCurrent = "Invader"
+                            ConfigData.FarmMapCurrent = "HallowsEve"
                         else
                             ConfigData.FarmMapCurrent = "Canyon"
                         end
@@ -3252,9 +3257,9 @@ task.spawn(function()
                         if ConfigData.FarmMapCurrent == "Canyon" then
                             hrp.CFrame = map2CFrame
                             NotifyToast("Auto Fishing", "berhasil TP ke Canyon", "success")
-                        elseif ConfigData.FarmMapCurrent == "Invader" then
+                        elseif ConfigData.FarmMapCurrent == "HallowsEve" then
                             hrp.CFrame = invaderCFrame
-                            NotifyToast("Auto Fishing", "berhasil TP ke Invader's", "success")
+                            NotifyToast("Auto Fishing", "berhasil TP ke Hallows Eve", "success")
                         else
                             local currentAngle = poolAngles[ConfigData.DualMapPoolIndex] or poolAngles[1]
                             hrp.CFrame = CFrame.new(standPositionRot) * CFrame.Angles(0, math.rad(currentAngle), 0)
@@ -3268,8 +3273,8 @@ task.spawn(function()
                     if UIStatus_Fishing then
                         if ConfigData.FarmMapCurrent == "Canyon" then
                             UIStatus_Fishing.Text = string.format("TRIPLE MAP (CANYON): SWAP IN %s", formatSecondsToText(sisaDual))
-                        elseif ConfigData.FarmMapCurrent == "Invader" then
-                            UIStatus_Fishing.Text = string.format("TRIPLE MAP (INVADER): SWAP IN %s", formatSecondsToText(sisaDual))
+                        elseif ConfigData.FarmMapCurrent == "HallowsEve" then
+                            UIStatus_Fishing.Text = string.format("TRIPLE MAP (HALLOWS EVE): SWAP IN %s", formatSecondsToText(sisaDual))
                         else
                             local sisaRot = rotateInterval - ConfigData.DualMapSubTimer
                             UIStatus_Fishing.Text = string.format("TRIPLE MAP (THRONE P%d): %s | SWAP: %s", ConfigData.DualMapPoolIndex, formatSecondsToText(sisaRot), formatSecondsToText(sisaDual))
